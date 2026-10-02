@@ -62,18 +62,35 @@ def _split_text(text, tokenizer, max_len=120):
     return chunks
 
 
-def _apply_repetition_penalty(logits, token_ids, penalty):
+def _apply_repetition_penalty(logits, token_ids, penalty, recent_window=128):
     """Reduce repeated-token scores regardless of the logit's sign."""
-    if penalty != 1.0 and token_ids:
-        indices = sorted(set(token_ids[-100:]))
-        scores = logits[:, indices]
-        logits[:, indices] = torch.where(scores < 0, scores * penalty, scores / penalty)
+    if penalty == 1.0 or not token_ids:
+        return logits
+
+    recent = token_ids[-recent_window:]
+    if not recent:
+        return logits
+
+    repeated = sorted(set(recent))
+    if not repeated:
+        return logits
+
+    scores = logits[:, repeated]
+    logits[:, repeated] = torch.where(scores < 0, scores * penalty, scores / penalty)
     return logits
+
+
+def _should_stop_on_repetition(token_ids, streak=4):
+    """Stop generation when the same audio token repeats for too long."""
+    if len(token_ids) < streak:
+        return False
+    recent = token_ids[-streak:]
+    return len(set(recent)) == 1
 
 
 @torch.no_grad()
 def generate(model, tokenizer, text, speaker_emb,
-             max_new_tokens=1024, temperature=0.65, top_k=250,
+             max_new_tokens=768, temperature=0.65, top_k=250,
              top_p=0.95, rep_penalty=1.2, device="cpu"):
     """Generate audio tokens from text."""
     if not math.isfinite(temperature) or temperature <= 0:
@@ -141,6 +158,11 @@ def generate(model, tokenizer, text, speaker_emb,
         tok_id = next_tok.item()
 
         if tok_id == END_OF_SPEECH_TOKEN_ID:
+            break
+
+        # Guard against endless repetition of the same token, which causes the voice to drag on.
+        if _should_stop_on_repetition(generated_tokens + [tok_id], streak=4):
+            print("[Auto-stop] Repetition loop detected; stopping generation early.")
             break
 
         generated_tokens.append(tok_id)
@@ -272,7 +294,7 @@ def main():
     p.add_argument("--top-k", type=int, default=250)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--rep-penalty", type=float, default=1.2)
-    p.add_argument("--max-tokens", type=int, default=1024)
+    p.add_argument("--max-tokens", type=int, default=768)
     p.add_argument("--device", default="cpu")
     a = p.parse_args()
     synthesize(a.checkpoint, a.text, a.output,
