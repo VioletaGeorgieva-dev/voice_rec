@@ -21,49 +21,58 @@ from codec import CodecV6
 from model import load_for_inference
 
 
-def _split_text(text, tokenizer, max_len=120):
-    """Split text into chunks that fit comfortably within bounds."""
+def _split_text(text, tokenizer, max_len=200):
+    """Split long text into chunks that respect encoder limits while keeping story flow.
+
+    The model is more stable on moderately sized chunks than on very short fragments.
+    """
     import re
-    if max_len < 3:
-        raise ValueError('max_len must leave room for text and two boundary tokens.')
+    if max_len < 20:
+        raise ValueError('max_len must be large enough to keep coherent chunks.')
+
     text = tokenizer.normalize_text(text)
-    sentences = re.split(r'(?<=[.!?;:,])\s+', text)
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?;:,])\s+', text) if s.strip()]
+    if not sentences:
+        return []
+
     chunks = []
     current = ""
+
     for sent in sentences:
         candidate = (current + " " + sent).strip() if current else sent
         enc_len = len(tokenizer.build_encoder_input(candidate))
+
         if enc_len <= max_len:
             current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        # If the sentence itself is too long, split it by words.
+        if len(tokenizer.build_encoder_input(sent)) > max_len:
+            words = sent.split()
+            current = ""
+            for w in words:
+                cand = (current + " " + w).strip() if current else w
+                if len(tokenizer.build_encoder_input(cand)) <= max_len:
+                    current = cand
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = w
         else:
-            if current:
-                chunks.append(current)
-            if len(tokenizer.build_encoder_input(sent)) > max_len:
-                words = sent.split()
-                current = ""
-                for w in words:
-                    cand = (current + " " + w).strip() if current else w
-                    if len(tokenizer.build_encoder_input(cand)) <= max_len:
-                        current = cand
-                    else:
-                        if current:
-                            chunks.append(current)
-                        current = ''
-                        for ch in w:
-                            if len(tokenizer.build_encoder_input(current + ch)) > max_len:
-                                chunks.append(current)
-                                current = ch
-                            else:
-                                current += ch
-            else:
-                current = sent
+            current = sent
+
     if current:
         chunks.append(current)
-    return chunks
+
+    return [c.strip() for c in chunks if c.strip()]
 
 
 def _apply_repetition_penalty(logits, token_ids, penalty, recent_window=128):
-    """Reduce repeated-token scores regardless of the logit's sign."""
+    """Reduce scores for recently repeated tokens to avoid endless loops and dragged-out audio."""
     if penalty == 1.0 or not token_ids:
         return logits
 
@@ -81,7 +90,7 @@ def _apply_repetition_penalty(logits, token_ids, penalty, recent_window=128):
 
 
 def _should_stop_on_repetition(token_ids, streak=4):
-    """Stop generation when the same audio token repeats for too long."""
+    """Stop when the same token repeats several times in a row."""
     if len(token_ids) < streak:
         return False
     recent = token_ids[-streak:]
@@ -90,9 +99,9 @@ def _should_stop_on_repetition(token_ids, streak=4):
 
 @torch.no_grad()
 def generate(model, tokenizer, text, speaker_emb,
-             max_new_tokens=768, temperature=0.65, top_k=250,
-             top_p=0.95, rep_penalty=1.2, device="cpu"):
-    """Generate audio tokens from text."""
+             max_new_tokens=768, temperature=0.45, top_k=120,
+             top_p=0.9, rep_penalty=1.3, device="cpu"):
+    """Generate audio tokens from text with repetition guardrails for long-form story generation."""
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError('temperature must be finite and positive.')
     if not 0 < top_p <= 1 or not math.isfinite(rep_penalty) or rep_penalty <= 0:
@@ -102,23 +111,19 @@ def generate(model, tokenizer, text, speaker_emb,
     if not tokenizer.encode_text(text):
         raise ValueError('Text contains no supported characters.')
 
-    # 1. Encode text
     enc_ids = tokenizer.build_encoder_input(text).unsqueeze(0).to(device)
     if enc_ids.shape[1] > model.config.max_text_len:
         raise ValueError('Text exceeds encoder capacity; split it with _split_text first.')
     enc_mask = torch.ones_like(enc_ids)
 
     enc_out = model.encode(enc_ids, enc_mask)
-
-    # 2. Prepare speaker embedding
     spk = speaker_emb.unsqueeze(0).to(device)
 
-    # 3. Start decoder
     dec_ids = torch.tensor([[START_OF_SPEECH_TOKEN_ID]], device=device)
     past = None
     generated_tokens = []
 
-    for step in range(max_new_tokens):
+    for _ in range(max_new_tokens):
         inp = dec_ids[:, -1:] if past is not None else dec_ids
 
         dec_out = model.decoder(
@@ -132,14 +137,12 @@ def generate(model, tokenizer, text, speaker_emb,
         past = dec_out["past_key_values"]
         logits = dec_out["logits"][:, -1, :]
 
-        # Mask: only allow audio tokens + end_of_speech
         mask = torch.full_like(logits, float("-inf"))
         mask[:, AUDIO_OFFSET:AUDIO_OFFSET + NUM_AUDIO_TOKENS] = 0
         mask[:, END_OF_SPEECH_TOKEN_ID] = 0
         logits = logits + mask
 
         _apply_repetition_penalty(logits, generated_tokens, rep_penalty)
-
         logits = logits / temperature
 
         if top_k > 0:
@@ -160,7 +163,6 @@ def generate(model, tokenizer, text, speaker_emb,
         if tok_id == END_OF_SPEECH_TOKEN_ID:
             break
 
-        # Guard against endless repetition of the same token, which causes the voice to drag on.
         if _should_stop_on_repetition(generated_tokens + [tok_id], streak=4):
             print("[Auto-stop] Repetition loop detected; stopping generation early.")
             break
@@ -181,9 +183,9 @@ def generate(model, tokenizer, text, speaker_emb,
 
 def synthesize(checkpoint, text, output="output.wav",
                speaker_wav=None, speaker_emb_path=None,
-               temperature=0.65, top_k=250, top_p=0.95,
-               rep_penalty=1.2, max_tokens=1024, device="cpu"):
-    """Full TTS pipeline: text → audio files."""
+               temperature=0.45, top_k=120, top_p=0.9,
+               rep_penalty=1.3, max_tokens=768, device="cpu"):
+    """Full TTS pipeline: text → audio files, tuned for longer story narration."""
     print(f"'{text[:80]}' | T={temperature}")
     model = load_for_inference(checkpoint, device=device)
     tokenizer = TTSTokenizer()
@@ -207,14 +209,12 @@ def synthesize(checkpoint, text, output="output.wav",
     else:
         raise ValueError("Provide speaker_wav or speaker_emb_path")
 
-    # Разбиване на кратки chunks (120 символа) за стабилен синтез
-    chunks = _split_text(text, tokenizer, max_len=120)
+    chunks = _split_text(text, tokenizer, max_len=200)
     if not chunks:
         raise ValueError('Provide non-empty text.')
     print(f"Text split into {len(chunks)} chunk(s)")
 
     t0 = time.time()
-
     output_path = Path(output)
     output_dir = output_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -224,11 +224,7 @@ def synthesize(checkpoint, text, output="output.wav",
 
     for i, chunk in enumerate(chunks):
         enc_len = len(tokenizer.build_encoder_input(chunk))
-
-        print(
-            f"  [{i + 1}/{len(chunks)}] "
-            f"{enc_len} enc tokens: '{chunk[:60]}...'"
-        )
+        print(f"  [{i + 1}/{len(chunks)}] {enc_len} enc tokens: '{chunk[:60]}...'")
 
         codes = generate(
             model,
@@ -250,20 +246,12 @@ def synthesize(checkpoint, text, output="output.wav",
             )
 
         part_output = output_dir / f"{base_name}_{i + 1:03d}.wav"
-
-        wav = codec.tokens_to_wav(
-            codes,
-            speaker_emb,
-            str(part_output)
-        )
+        wav = codec.tokens_to_wav(codes, speaker_emb, str(part_output))
 
         duration = len(wav) / CODEC_SAMPLE_RATE
         total_audio += duration
 
-        print(
-            f"    Saved: {part_output.name} "
-            f"({duration:.2f}s)"
-        )
+        print(f"    Saved: {part_output.name} ({duration:.2f}s)")
 
         del codes
         del wav
@@ -275,11 +263,7 @@ def synthesize(checkpoint, text, output="output.wav",
     rtf = gen_time / total_audio if total_audio > 0 else float("inf")
 
     print()
-    print(
-        f"Total: {total_audio:.1f}s audio, "
-        f"{gen_time:.2f}s gen, RTF={rtf:.3f}"
-    )
-
+    print(f"Total: {total_audio:.1f}s audio, {gen_time:.2f}s gen, RTF={rtf:.3f}")
     return None
 
 
@@ -290,10 +274,10 @@ def main():
     p.add_argument("--output", default="output.wav")
     p.add_argument("--speaker-wav", help="Reference audio for voice cloning")
     p.add_argument("--speaker-emb", help="Path to saved speaker embedding .pt")
-    p.add_argument("--temperature", type=float, default=0.65)
-    p.add_argument("--top-k", type=int, default=250)
-    p.add_argument("--top-p", type=float, default=0.95)
-    p.add_argument("--rep-penalty", type=float, default=1.2)
+    p.add_argument("--temperature", type=float, default=0.45)
+    p.add_argument("--top-k", type=int, default=120)
+    p.add_argument("--top-p", type=float, default=0.90)
+    p.add_argument("--rep-penalty", type=float, default=1.30)
     p.add_argument("--max-tokens", type=int, default=768)
     p.add_argument("--device", default="cpu")
     a = p.parse_args()
