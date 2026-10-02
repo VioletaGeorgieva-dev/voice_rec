@@ -17,7 +17,7 @@ Key differences from V5:
   - d=384 for both encoder and decoder (V5: enc=512, dec=768)
   - 8 decoder layers (V5: 18)
   - Speaker embedding injection (V5: discrete speaker tokens)
-  - max_text=256, max_audio=512 (V5: 512/2048)
+  - max_text=256, max_audio=1024 (V5: 512/2048) — OPTIMIZED FOR LONG STORIES
   - ~40M params (V5: 250M)
   - Expected RTF ~0.15-0.25 (V5: 1.1)
 """
@@ -116,8 +116,13 @@ DEC_N_LAYERS   = 8
 DEC_D_FF       = 1536
 
 MAX_TEXT_LEN   = 256         # Max text tokens (chars) — covers ~17s speech
-MAX_AUDIO_LEN  = 512         # Max audio tokens — 512/25 = 20.5s
+MAX_AUDIO_LEN  = 1024        # Max audio tokens — 1024/25 = 41s (OPTIMIZED FOR STORIES)
 DROPOUT        = 0.0
+
+# ── Long-form synthesis config (for stories) ───────────────────
+STORY_CHUNK_LEN = 200        # Target chunk length in tokens (adaptive for stories)
+STORY_MIN_CHUNK = 80         # Minimum chunk length to avoid too many splits
+STORY_OVERLAP   = 20         # Token overlap between chunks for context preservation
 
 # ── Training defaults ──────────────────────────────────────────
 BATCH_SIZE     = 16          # Smaller model = bigger batch
@@ -140,3 +145,5 @@ if __name__ == "__main__":
     print(f"V6 Codec:   MioCodec {CODEC_FRAME_RATE}fps, {CODEC_NUM_CODEBOOKS}CB × {CODEC_CODEBOOK_SIZE}")
     print(f"V6 Speaker: {SPEAKER_EMB_DIM}-dim global_embedding")
     print(f"V6 Limits:  max_text={MAX_TEXT_LEN}, max_audio={MAX_AUDIO_LEN}")
+    print(f"V6 Stories: chunk_len={STORY_CHUNK_LEN}, overlap={STORY_OVERLAP}")
+
